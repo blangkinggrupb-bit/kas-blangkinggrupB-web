@@ -1,170 +1,183 @@
 import streamlit as st
-import pandas as pd
 import json
 import os
-import shutil
+import pandas as pd
 from datetime import datetime
 import urllib.parse
-from fpdf import FPDF
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
+import plotly.graph_objects as go
 
 # --- KONFIGURASI HALAMAN ---
 st.set_page_config(page_title="Kas Blangking Web", layout="wide")
 
-# --- STYLE CSS CUSTOM ---
-st.markdown("""
-    <style>
-    .main { background-color: #f5f7f9; }
-    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #1e88e5; color: white; }
-    .header-kas { text-align: center; color: #1e88e5; font-weight: bold; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- FUNGSI DATA ---
+# --- DATABASE LOGIC ---
 FILE_DATA = "data_kas_blangking_v9.json"
 
 def load_data():
     if os.path.exists(FILE_DATA):
-        with open(FILE_DATA, "r") as f:
-            return json.load(f)
+        try:
+            with open(FILE_DATA, "r") as f:
+                return json.load(f)
+        except:
+            pass
     return {"anggota": {}, "transaksi": [], "p3k": [], "config": {"nom_iuran": "10000"}}
 
 def save_data(data):
     with open(FILE_DATA, "w") as f:
         json.dump(data, f)
-    # Trigger backup email di sini jika perlu
 
-# --- SESSION STATE (DB) ---
-if 'db' not in st.session_state:
-    st.session_state.db = load_data()
+if 'data' not in st.session_state:
+    st.session_state.data = load_data()
 
-db = st.session_state.db
+data = st.session_state.data
 
-# --- LOGIN SYSTEM ---
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
+# --- SESSION STATE UNTUK LOGIN ---
+if 'role' not in st.session_state:
+    st.session_state.role = None
 
-if not st.session_state.logged_in:
-    st.markdown("<h1 class='header-kas'>KAS BLANGKING</h1>", unsafe_allow_html=True)
-    with st.container():
-        col1, col2, col3 = st.columns([1,2,1])
-        with col2:
-            pw = st.text_input("Admin Password", type="password")
-            if st.button("Masuk"):
-                if pw == "1234":
-                    st.session_state.logged_in = True
-                    st.rerun()
-                else:
-                    st.error("Password Salah")
+# --- FUNGSI LOGIN ---
+def login_ui():
+    st.title("🔐 Akses Kas Blangking")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Admin Login")
+        pw = st.text_input("Masukkan Password Admin", type="password")
+        if st.button("Masuk sebagai Admin"):
+            if pw == "1234":
+                st.session_state.role = "admin"
+                st.rerun()
+            else:
+                st.error("Password Admin Salah")
+                
+    with col2:
+        st.subheader("User Access")
+        st.write("Akses terbatas untuk melihat laporan saja.")
+        if st.button("Masuk sebagai User (View Only)"):
+            st.session_state.role = "user"
+            st.rerun()
+
+if st.session_state.role is None:
+    login_ui()
     st.stop()
 
-# --- SIDEBAR NAVIGASI ---
-menu = st.sidebar.selectbox("MENU UTAMA", ["Dashboard", "Input Transaksi", "Ceklis Iuran", "Data Anggota", "Riwayat", "Stok P3K"])
+# --- HITUNG SALDO (GLOBAL) ---
+st_in = sum(t['jumlah'] for t in data['transaksi'] if t['metode'] == "Tunai")
+sq_in = sum(t['jumlah'] for t in data['transaksi'] if t['metode'] == "QRIS")
+st_out = sum(t['jumlah'] for t in data['transaksi'] if t['metode'] == "KELUAR TUNAI")
+sq_out = sum(t['jumlah'] for t in data['transaksi'] if t['metode'] == "KELUAR QRIS")
+saldo_tunai = st_in - st_out
+saldo_qris = sq_in - sq_out
+total_saldo = saldo_tunai + saldo_qris
 
-# --- LOGIKA DASHBOARD ---
-if menu == "Dashboard":
-    st.markdown("<h2 class='header-kas'>DASHBOARD KAS</h2>", unsafe_allow_html=True)
-    
-    df_tr = pd.DataFrame(db['transaksi'])
-    if not df_tr.empty:
-        # Hitung Saldo
-        tin = df_tr[df_tr['metode'] == 'Tunai']['jumlah'].sum()
-        qin = df_tr[df_tr['metode'] == 'QRIS']['jumlah'].sum()
-        tout = df_tr[df_tr['metode'] == 'KELUAR TUNAI']['jumlah'].sum()
-        qout = df_tr[df_tr['metode'] == 'KELUAR QRIS']['jumlah'].sum()
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("SALDO TUNAI", f"Rp {tin-tout:,}")
-        c2.metric("SALDO QRIS", f"Rp {qin-qout:,}")
-        c3.metric("TOTAL SALDO", f"Rp {(tin+qin)-(tout+qout):,}")
-        
-        st.bar_chart({"Tunai": tin-tout, "QRIS": qin-qout})
-    else:
-        st.info("Belum ada data transaksi.")
-
-# --- INPUT TRANSAKSI ---
-elif menu == "Input Transaksi":
-    st.subheader("Tambah Transaksi Baru")
-    with st.form("form_transaksi"):
-        col1, col2 = st.columns(2)
-        nama = col1.selectbox("Nama Anggota", list(db['anggota'].keys()))
-        nom = col2.number_input("Nominal (Rp)", min_value=0, step=5000)
-        ket = col1.text_input("Keterangan")
-        met = col2.selectbox("Metode", ["Tunai", "QRIS", "KELUAR TUNAI", "KELUAR QRIS"])
-        tgl = col1.date_input("Tanggal")
-        
-        submit = st.form_submit_button("SIMPAN")
-        wa_submit = st.form_submit_button("SIMPAN & KIRIM WA")
-
-        if submit or wa_submit:
-            new_id = str(datetime.now().timestamp())
-            tgl_str = tgl.strftime("%d-%m-%Y")
-            entry = {
-                "id": new_id, "nama": nama, "metode": met, "tgl": tgl_str,
-                "bln": tgl.strftime("%m"), "thn": tgl.strftime("%Y"),
-                "jumlah": int(nom), "keterangan": f"{ket} - {nama}"
-            }
-            db['transaksi'].append(entry)
-            save_data(db)
-            st.success("Data Tersimpan!")
-            
-            if wa_submit:
-                msg = f"*BUKTI KAS BLANGKING*\n\nTerima kasih *{nama}*.\nDana Rp{nom:,} telah kami terima ({met})\nKeperluan: {ket}\nTgl: {tgl_str}"
-                wa_no = db['anggota'][nama]['wa']
-                if wa_no.startswith('0'): wa_no = '62' + wa_no[1:]
-                url = f"https://wa.me/{wa_no}?text={urllib.parse.quote(msg)}"
-                st.markdown(f'<meta http-equiv="refresh" content="0;URL=\'{url}\'"/>', unsafe_allow_html=True)
-
-# --- CEKLIS IURAN ---
-elif menu == "Ceklis Iuran":
-    st.subheader("Tabel Ceklis Iuran")
-    thn_view = st.selectbox("Pilih Tahun", [str(i) for i in range(2025, 2031)])
-    
-    # Logika hitung iuran (Disederhanakan untuk web)
-    data_ceklis = []
-    nom_iuran = int(db['config']['nom_iuran'])
-    
-    for nama, info in db['anggota'].items():
-        # Hitung total iuran masuk untuk nama tersebut
-        total_bayar = sum(t['jumlah'] for t in db['transaksi'] if t['nama'] == nama and "iuran" in t['keterangan'].lower())
-        bulan_lunas = total_bayar // nom_iuran
-        data_ceklis.append({"Nama": nama, "Total Bulan Lunas": bulan_lunas, "Sisa Saldo": total_bayar % nom_iuran})
-    
-    st.table(data_ceklis)
-
-# --- RIWAYAT ---
-elif menu == "Riwayat":
-    st.subheader("Riwayat Transaksi Lengkap")
-    df_hist = pd.DataFrame(db['transaksi'])
-    if not df_hist.empty:
-        st.dataframe(df_hist, use_container_width=True)
-        if st.button("Hapus Transaksi Terakhir"):
-            db['transaksi'].pop()
-            save_data(db)
-            st.rerun()
-    else:
-        st.write("Belum ada riwayat.")
-
-# --- DATA ANGGOTA ---
-elif menu == "Data Anggota":
-    st.subheader("Manajemen Anggota")
-    with st.expander("Tambah Anggota Baru"):
-        n_m = st.text_input("Nama Lengkap")
-        w_m = st.text_input("No WhatsApp (Contoh: 0812...)")
-        if st.button("Simpan Anggota"):
-            db['anggota'][n_m] = {"wa": w_m, "bln_masuk": "01", "thn_masuk": "2025"}
-            save_data(db)
-            st.rerun()
-    
-    st.write("Daftar Anggota Saat Ini:")
-    st.json(db['anggota'])
-
-# --- FOOTER ---
-st.sidebar.markdown("---")
+# --- SIDEBAR ---
+st.sidebar.title(f"👤 Role: {st.session_state.role.upper()}")
+st.sidebar.metric("Total Saldo", f"Rp {total_saldo:,}")
+st.sidebar.write(f"Tunai: Rp {saldo_tunai:,}")
+st.sidebar.write(f"QRIS: Rp {saldo_qris:,}")
 if st.sidebar.button("Logout"):
-    st.session_state.logged_in = False
+    st.session_state.role = None
     st.rerun()
+
+# --- MAIN APP ---
+st.title("🟦 KAS BLANGKING GRUP B")
+
+# Definisi Tab berdasarkan Role
+if st.session_state.role == "admin":
+    tabs = st.tabs(["📝 Input Transaksi", "✅ Ceklis Iuran", "📊 Riwayat & Grafik", "💊 P3K", "👥 Anggota"])
+else:
+    tabs = st.tabs(["✅ Ceklis Iuran", "📊 Riwayat & Grafik", "💊 P3K"])
+
+# --- TAB CEKLIS IURAN (Akses: Admin & User) ---
+idx_tab_ceklis = 1 if st.session_state.role == "admin" else 0
+with tabs[idx_tab_ceklis]:
+    st.subheader("📋 Status Iuran Anggota")
+    thn_view = st.selectbox("Tahun", [str(i) for i in range(2025, 2030)])
+    nom_iuran = int(data['config'].get("nom_iuran", 10000))
+    
+    pembayaran_iuran = {}
+    for tr in data['transaksi']:
+        if "iuran" in tr['keterangan'].lower() and "KELUAR" not in tr['metode']:
+            pembayaran_iuran[tr['nama']] = pembayaran_iuran.get(tr['nama'], 0) + (tr['jumlah'] // nom_iuran)
+
+    rows = []
+    now = datetime.now()
+    idx_now = ((now.year - 2025) * 12) + (now.month - 1)
+    
+    for nama in sorted(data['anggota'].keys()):
+        detail = data['anggota'][nama]
+        idx_gabung = ((int(detail.get("thn_masuk", 2025)) - 2025) * 12) + (int(detail.get("bln_masuk", 1)) - 1)
+        total_bayar = pembayaran_iuran.get(nama, 0)
+        
+        row = {"Nama": nama}
+        for m_idx, m_name in enumerate(["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agt", "Sep", "Okt", "Nov", "Des"]):
+            idx_cek = ((int(thn_view) - 2025) * 12) + m_idx
+            if idx_cek < idx_gabung: row[m_name] = "⚪"
+            elif total_bayar > (idx_cek - idx_gabung): row[m_name] = "✅"
+            else: row[m_name] = "❌"
+        
+        wajib = max(0, (idx_now - idx_gabung) + 1)
+        tunggakan = wajib - total_bayar
+        row["Tunggakan"] = f"Rp {tunggakan * nom_iuran:,}" if tunggakan > 0 else "LUNAS"
+        rows.append(row)
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+# --- TAB RIWAYAT & GRAFIK (Akses: Admin & User) ---
+idx_tab_hist = 2 if st.session_state.role == "admin" else 1
+with tabs[idx_tab_hist]:
+    st.subheader("📈 Grafik Saldo")
+    fig = go.Figure(data=[
+        go.Bar(name='Tunai', x=['Saldo'], y=[saldo_tunai], marker_color='#1E90FF'),
+        go.Bar(name='QRIS', x=['Saldo'], y=[saldo_qris], marker_color='#32CD32')
+    ])
+    fig.update_layout(barmode='group', height=400)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("📜 Riwayat Transaksi")
+    if data['transaksi']:
+        df_hist = pd.DataFrame(data['transaksi']).sort_index(ascending=False)
+        st.dataframe(df_hist[['tgl', 'nama', 'jumlah', 'metode', 'keterangan']], use_container_width=True)
+
+# --- TAB P3K (Akses: Admin & User) ---
+idx_tab_p3k = 3 if st.session_state.role == "admin" else 2
+with tabs[idx_tab_p3k]:
+    st.subheader("💊 Stok Obat P3K")
+    if st.session_state.role == "admin":
+        with st.expander("Update Stok P3K"):
+            p_nama = st.text_input("Nama Obat")
+            p_stok = st.number_input("Jumlah Stok", min_value=0)
+            if st.button("Simpan Obat"):
+                data['p3k'].append({"nama": p_nama, "stok": p_stok, "tgl": datetime.now().strftime("%d-%m-%Y")})
+                save_data(data); st.rerun()
+    
+    if data['p3k']:
+        st.table(data['p3k'])
+
+# --- KHUSUS TAB ADMIN: INPUT TRANSAKSI & ANGGOTA ---
+if st.session_state.role == "admin":
+    with tabs[0]:
+        st.subheader("📥 Input Transaksi")
+        c1, c2 = st.columns(2)
+        with c1:
+            n_in = st.selectbox("Pilih Anggota", sorted(data['anggota'].keys()))
+            m_in = st.selectbox("Metode", ["Tunai", "QRIS", "KELUAR TUNAI", "KELUAR QRIS"])
+        with c2:
+            nom_in = st.number_input("Nominal", min_value=0, step=5000)
+            ket_in = st.text_input("Keterangan")
+        
+        if st.button("Simpan Transaksi"):
+            data['transaksi'].append({
+                "id": str(datetime.now().timestamp()), "nama": n_in, "metode": m_in,
+                "tgl": datetime.now().strftime("%d-%m-%Y"), "jumlah": int(nom_in), "keterangan": ket_in
+            })
+            save_data(data); st.success("Tersimpan!"); st.rerun()
+
+    with tabs[4]:
+        st.subheader("👥 Manajemen Anggota")
+        with st.expander("Tambah Anggota Baru"):
+            n_agt = st.text_input("Nama Anggota")
+            w_agt = st.text_input("WhatsApp (628...)")
+            if st.button("Simpan Anggota"):
+                data['anggota'][n_agt] = {"wa": w_agt, "bln_masuk": datetime.now().strftime("%m"), "thn_masuk": "2025"}
+                save_data(data); st.rerun()
+        st.write(data['anggota'])
